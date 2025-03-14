@@ -1,426 +1,578 @@
 <?php
 /**
- * Controlador de Assinaturas
- * Responsável por gerenciar planos, assinaturas e pagamentos
+ * Controlador para gerenciamento de assinaturas
+ * 
+ * Gerencia operações relacionadas a assinaturas como visualização de planos,
+ * checkout, alterações de plano e cancelamentos.
+ * 
+ * Status: 90% Completo
+ * Pendente:
+ * - Implementar histórico de faturamento completo
+ * - Adicionar métricas de uso de recursos
  */
 
+require_once __DIR__ . '/../models/Account/Plan.php';
+require_once __DIR__ . '/../models/Account/Subscription.php';
+require_once __DIR__ . '/../services/SubscriptionService.php';
+require_once __DIR__ . '/../services/StripeService.php';
+require_once __DIR__ . '/../includes/session.php';
+require_once __DIR__ . '/../includes/validation.php';
+require_once __DIR__ . '/../includes/feature-checker.php';
+
 class SubscriptionController {
+    private $subscriptionService;
+    private $stripeService;
+    
+    public function __construct() {
+        $this->subscriptionService = new SubscriptionService();
+        $this->stripeService = new StripeService();
+    }
+    
     /**
      * Exibe a página de planos disponíveis
      */
-    public function plans() {
-        // Se o usuário estiver autenticado, verificar se já tem uma assinatura
-        if (isAuthenticated()) {
-            $pdo = db();
-            $stmt = $pdo->prepare("
-                SELECT s.*, p.name as plan_name, p.code as plan_code 
-                FROM subscriptions s 
-                JOIN plans p ON s.plan_id = p.id 
-                WHERE s.tenant_id = ? AND s.status != 'canceled'
-            ");
-            $stmt->execute([$_SESSION['tenant_id']]);
-            $subscription = $stmt->fetch();
-            
-            if ($subscription) {
-                // Redirecionar para página de gestão de assinatura
-                redirect(APP_URL . '/subscription/manage');
-                return;
-            }
+    public function index() {
+        // Verificar se o usuário está logado
+        if (!isset($_SESSION['user_id'])) {
+            header('Location: /auth/login');
+            exit;
         }
         
-        // Carregar todos os planos ativos
-        $pdo = db();
-        $stmt = $pdo->prepare("SELECT * FROM plans WHERE active = 1 ORDER BY price ASC");
-        $stmt->execute();
-        $plans = $stmt->fetchAll();
+        // Obter o tenant_id do usuário logado
+        $tenantId = $_SESSION['tenant_id'];
         
-        // Exibir planos
-        $pageTitle = 'Planos de Assinatura';
-        require_once APP_PATH . '/views/subscription/plans.php';
+        // Obter a assinatura atual, se existir
+        $subscription = null;
+        if ($tenantId) {
+            $subscriptionModel = new Subscription();
+            $subscription = $subscriptionModel->getActiveSubscriptionByTenantId($tenantId);
+        }
+        
+        // Obter todos os planos disponíveis
+        $planModel = new Plan();
+        $plans = $planModel->getAllActivePlans();
+        
+        // Incluir a view
+        require_once __DIR__ . '/../views/subscription/plans.php';
     }
     
     /**
      * Exibe a página de checkout para um plano específico
      */
-    public function checkout($planCode = null) {
-        // Verificar se o usuário está autenticado
-        if (!isAuthenticated()) {
-            setFlashMessage('error', 'Faça login para continuar com a assinatura.');
-            redirect(APP_URL . '/auth/login');
-            return;
+    public function checkout($planId = null) {
+        // Verificar se o usuário está logado
+        if (!isset($_SESSION['user_id'])) {
+            header('Location: /auth/login');
+            exit;
         }
         
-        // Verificar se o código do plano foi fornecido
-        if (empty($planCode)) {
-            redirect(APP_URL . '/subscription/plans');
-            return;
+        // Verificar se o plano foi especificado
+        if (!$planId) {
+            $_SESSION['error_message'] = 'Plano não especificado.';
+            header('Location: /subscription');
+            exit;
         }
         
-        // Carregar dados do plano
-        $pdo = db();
-        $stmt = $pdo->prepare("SELECT * FROM plans WHERE code = ? AND active = 1");
-        $stmt->execute([$planCode]);
-        $plan = $stmt->fetch();
+        // Obter detalhes do plano
+        $planModel = new Plan();
+        $plan = $planModel->getPlanById($planId);
         
         if (!$plan) {
-            setFlashMessage('error', 'Plano não encontrado ou indisponível.');
-            redirect(APP_URL . '/subscription/plans');
-            return;
+            $_SESSION['error_message'] = 'Plano não encontrado.';
+            header('Location: /subscription');
+            exit;
         }
         
-        // Carregar dados da conta do usuário
-        $stmt = $pdo->prepare("SELECT * FROM tenants WHERE id = ?");
-        $stmt->execute([$_SESSION['tenant_id']]);
-        $tenant = $stmt->fetch();
+        // Obter o tenant_id do usuário logado
+        $tenantId = $_SESSION['tenant_id'];
         
-        if (!$tenant) {
-            setFlashMessage('error', 'Conta não encontrada.');
-            redirect(APP_URL . '/auth/logout');
-            return;
+        // Verificar se já existe uma assinatura ativa
+        $subscriptionModel = new Subscription();
+        $existingSubscription = $subscriptionModel->getActiveSubscriptionByTenantId($tenantId);
+        
+        // Se já existe uma assinatura, redirecionar para página de mudança de plano
+        if ($existingSubscription) {
+            header('Location: /subscription/change-plan/' . $planId);
+            exit;
         }
         
-        // Iniciar o Stripe
-        $stripeService = new StripeService();
+        // Criar cliente Stripe público para o frontend
+        $stripePublicKey = STRIPE_PUBLIC_KEY;
         
-        // Verificar se o cliente já existe no Stripe
-        $stripeCustomerId = $tenant['stripe_customer_id'] ?? null;
-        
-        if (!$stripeCustomerId) {
-            // Criar cliente no Stripe
-            $customer = $stripeService->createCustomer([
-                'email' => $tenant['email'],
-                'name' => $tenant['name'],
-                'description' => 'Cliente ID: ' . $tenant['id'],
-                'metadata' => [
-                    'tenant_id' => $tenant['id']
-                ]
-            ]);
-            
-            $stripeCustomerId = $customer->id;
-            
-            // Atualizar o ID do cliente no banco
-            $stmt = $pdo->prepare("UPDATE tenants SET stripe_customer_id = ? WHERE id = ?");
-            $stmt->execute([$stripeCustomerId, $tenant['id']]);
-        }
-        
-        // Criar sessão de checkout do Stripe
-        $session = $stripeService->createCheckoutSession([
-            'customer' => $stripeCustomerId,
-            'success_url' => APP_URL . '/subscription/success?session_id={CHECKOUT_SESSION_ID}',
-            'cancel_url' => APP_URL . '/subscription/plans',
-            'payment_method_types' => ['card'],
-            'mode' => 'subscription',
-            'line_items' => [
-                [
-                    'price' => $plan['stripe_price_id'],
-                    'quantity' => 1
-                ]
-            ],
-            'metadata' => [
-                'tenant_id' => $tenant['id'],
-                'plan_id' => $plan['id'],
-                'plan_code' => $plan['code']
-            ]
-        ]);
-        
-        // Exibir página de checkout
-        $pageTitle = 'Finalizar Assinatura';
-        $checkoutSessionId = $session->id;
-        $stripePublicKey = getenv('STRIPE_PUBLIC_KEY') ?: 'pk_test_your_key';
-        
-        require_once APP_PATH . '/views/subscription/checkout.php';
+        // Incluir a view
+        require_once __DIR__ . '/../views/subscription/checkout.php';
     }
     
     /**
-     * Processa o sucesso da assinatura após checkout
+     * Processa o checkout de uma assinatura
+     */
+    public function processCheckout() {
+        // Verificar se o usuário está logado
+        if (!isset($_SESSION['user_id'])) {
+            header('Location: /auth/login');
+            exit;
+        }
+        
+        // Verificar se os dados foram enviados via POST
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            $_SESSION['error_message'] = 'Método inválido.';
+            header('Location: /subscription');
+            exit;
+        }
+        
+        // Validar os dados recebidos
+        $planId = isset($_POST['plan_id']) ? intval($_POST['plan_id']) : null;
+        $paymentMethodId = isset($_POST['payment_method_id']) ? $_POST['payment_method_id'] : null;
+        
+        if (!$planId || !$paymentMethodId) {
+            $_SESSION['error_message'] = 'Dados de pagamento ou plano inválidos.';
+            header('Location: /subscription/checkout/' . $planId);
+            exit;
+        }
+        
+        $tenantId = $_SESSION['tenant_id'];
+        
+        // Criar a assinatura
+        $result = $this->subscriptionService->createSubscription($tenantId, $planId, $paymentMethodId);
+        
+        if (!$result['success']) {
+            $_SESSION['error_message'] = 'Erro ao processar assinatura: ' . $result['error'];
+            header('Location: /subscription/checkout/' . $planId);
+            exit;
+        }
+        
+        // Assinatura criada com sucesso, redirecionar para página de sucesso
+        $_SESSION['success_message'] = 'Assinatura criada com sucesso!';
+        header('Location: /subscription/success');
+        exit;
+    }
+    
+    /**
+     * Exibe a página de sucesso após criação da assinatura
      */
     public function success() {
-        // Verificar se o usuário está autenticado
-        if (!isAuthenticated()) {
-            setFlashMessage('error', 'Faça login para continuar.');
-            redirect(APP_URL . '/auth/login');
-            return;
-        }
-        
-        // Verificar se o ID da sessão foi fornecido
-        $sessionId = $_GET['session_id'] ?? null;
-        
-        if (empty($sessionId)) {
-            redirect(APP_URL . '/subscription/plans');
-            return;
+        // Verificar se o usuário está logado
+        if (!isset($_SESSION['user_id'])) {
+            header('Location: /auth/login');
+            exit;
         }
         
         $tenantId = $_SESSION['tenant_id'];
         
-        // Iniciar o Stripe e recuperar a sessão
-        $stripeService = new StripeService();
-        $session = $stripeService->getCheckoutSession($sessionId);
+        // Obter detalhes da assinatura recém-criada
+        $subscriptionModel = new Subscription();
+        $subscription = $subscriptionModel->getActiveSubscriptionByTenantId($tenantId);
         
-        if (!$session || $session->metadata->tenant_id != $tenantId) {
-            setFlashMessage('error', 'Sessão de checkout inválida.');
-            redirect(APP_URL . '/subscription/plans');
-            return;
+        if (!$subscription) {
+            $_SESSION['error_message'] = 'Nenhuma assinatura ativa encontrada.';
+            header('Location: /subscription');
+            exit;
         }
         
-        // Recuperar o plano
-        $pdo = db();
-        $stmt = $pdo->prepare("SELECT * FROM plans WHERE id = ?");
-        $stmt->execute([$session->metadata->plan_id]);
-        $plan = $stmt->fetch();
+        // Obter detalhes do plano
+        $planModel = new Plan();
+        $plan = $planModel->getPlanById($subscription['plan_id']);
         
-        if (!$plan) {
-            setFlashMessage('error', 'Plano não encontrado.');
-            redirect(APP_URL . '/subscription/plans');
-            return;
-        }
-        
-        // Criar ou atualizar assinatura no sistema
-        $subscription = [
-            'tenant_id' => $tenantId,
-            'plan_id' => $plan['id'],
-            'stripe_subscription_id' => $session->subscription,
-            'stripe_customer_id' => $session->customer,
-            'status' => 'active',
-            'trial_ends_at' => date('Y-m-d H:i:s', strtotime('+' . TRIAL_PERIOD_DAYS . ' days')),
-            'next_billing_at' => date('Y-m-d H:i:s', strtotime('+' . TRIAL_PERIOD_DAYS . ' days'))
-        ];
-        
-        // Verificar se já existe uma assinatura
-        $stmt = $pdo->prepare("SELECT id FROM subscriptions WHERE tenant_id = ?");
-        $stmt->execute([$tenantId]);
-        $existingSubscription = $stmt->fetch();
-        
-        if ($existingSubscription) {
-            // Atualizar assinatura existente
-            $stmt = $pdo->prepare("
-                UPDATE subscriptions 
-                SET plan_id = ?, stripe_subscription_id = ?, stripe_customer_id = ?, 
-                    status = ?, trial_ends_at = ?, next_billing_at = ?, updated_at = NOW() 
-                WHERE id = ?
-            ");
-            $stmt->execute([
-                $subscription['plan_id'],
-                $subscription['stripe_subscription_id'],
-                $subscription['stripe_customer_id'],
-                $subscription['status'],
-                $subscription['trial_ends_at'],
-                $subscription['next_billing_at'],
-                $existingSubscription['id']
-            ]);
-        } else {
-            // Criar nova assinatura
-            $stmt = $pdo->prepare("
-                INSERT INTO subscriptions 
-                (tenant_id, plan_id, stripe_subscription_id, stripe_customer_id, status, trial_ends_at, next_billing_at) 
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            ");
-            $stmt->execute([
-                $subscription['tenant_id'],
-                $subscription['plan_id'],
-                $subscription['stripe_subscription_id'],
-                $subscription['stripe_customer_id'],
-                $subscription['status'],
-                $subscription['trial_ends_at'],
-                $subscription['next_billing_at']
-            ]);
-        }
-        
-        setFlashMessage('success', 'Assinatura realizada com sucesso! Seu período de teste começa agora.');
-        
-        // Exibir página de sucesso
-        $pageTitle = 'Assinatura Realizada';
-        require_once APP_PATH . '/views/subscription/success.php';
+        // Incluir a view
+        require_once __DIR__ . '/../views/subscription/success.php';
     }
     
     /**
-     * Exibe a página de gerenciamento da assinatura
+     * Exibe a página de gerenciamento de assinatura
      */
     public function manage() {
-        // Verificar se o usuário está autenticado
-        if (!isAuthenticated()) {
-            setFlashMessage('error', 'Faça login para continuar.');
-            redirect(APP_URL . '/auth/login');
-            return;
+        // Verificar se o usuário está logado
+        if (!isset($_SESSION['user_id'])) {
+            header('Location: /auth/login');
+            exit;
         }
         
         $tenantId = $_SESSION['tenant_id'];
         
-        // Carregar dados da assinatura
-        $pdo = db();
-        $stmt = $pdo->prepare("
-            SELECT s.*, p.name as plan_name, p.code as plan_code, p.price as plan_price,
-                   p.features as plan_features, p.limits as plan_limits
-            FROM subscriptions s 
-            JOIN plans p ON s.plan_id = p.id 
-            WHERE s.tenant_id = ? AND s.status != 'canceled'
-        ");
-        $stmt->execute([$tenantId]);
-        $subscription = $stmt->fetch();
+        // Obter detalhes da assinatura
+        $subscriptionModel = new Subscription();
+        $subscription = $subscriptionModel->getActiveSubscriptionByTenantId($tenantId);
         
         if (!$subscription) {
-            redirect(APP_URL . '/subscription/plans');
-            return;
+            $_SESSION['error_message'] = 'Nenhuma assinatura ativa encontrada.';
+            header('Location: /subscription');
+            exit;
         }
         
-        // Carregar faturas
-        $stmt = $pdo->prepare("
-            SELECT * FROM invoices
-            WHERE tenant_id = ? 
-            ORDER BY created_at DESC
-            LIMIT 10
-        ");
-        $stmt->execute([$tenantId]);
-        $invoices = $stmt->fetchAll();
+        // Obter detalhes do plano
+        $planModel = new Plan();
+        $plan = $planModel->getPlanById($subscription['plan_id']);
         
-        // Carregar uso de recursos
-        $stmt = $pdo->prepare("
-            SELECT resource_type, SUM(resource_count) as total 
-            FROM resource_usage 
-            WHERE tenant_id = ? AND year = ? AND month = ? 
-            GROUP BY resource_type
-        ");
-        $stmt->execute([$tenantId, date('Y'), date('n')]);
-        $resourceUsage = [];
+        // Obter histórico de faturas
+        $invoices = $subscriptionModel->getInvoicesBySubscriptionId($subscription['id']);
         
-        while ($row = $stmt->fetch()) {
-            $resourceUsage[$row['resource_type']] = $row['total'];
-        }
-        
-        // Exibir página de gerenciamento
-        $pageTitle = 'Gerenciar Assinatura';
-        require_once APP_PATH . '/views/subscription/manage.php';
+        // Incluir a view
+        require_once __DIR__ . '/../views/subscription/manage.php';
     }
     
     /**
-     * Processa a criação de portal de faturamento do Stripe
+     * Exibe a página de mudança de plano
      */
-    public function billingPortal() {
-        // Verificar se o usuário está autenticado
-        if (!isAuthenticated()) {
-            setFlashMessage('error', 'Faça login para continuar.');
-            redirect(APP_URL . '/auth/login');
-            return;
+    public function changePlan($newPlanId = null) {
+        // Verificar se o usuário está logado
+        if (!isset($_SESSION['user_id'])) {
+            header('Location: /auth/login');
+            exit;
+        }
+        
+        // Verificar se o plano foi especificado
+        if (!$newPlanId) {
+            $_SESSION['error_message'] = 'Novo plano não especificado.';
+            header('Location: /subscription/manage');
+            exit;
         }
         
         $tenantId = $_SESSION['tenant_id'];
         
-        // Carregar dados da assinatura
-        $pdo = db();
-        $stmt = $pdo->prepare("
-            SELECT s.*, t.stripe_customer_id 
-            FROM subscriptions s 
-            JOIN tenants t ON s.tenant_id = t.id
-            WHERE s.tenant_id = ? AND s.status != 'canceled'
-        ");
-        $stmt->execute([$tenantId]);
-        $subscription = $stmt->fetch();
+        // Obter detalhes da assinatura atual
+        $subscriptionModel = new Subscription();
+        $subscription = $subscriptionModel->getActiveSubscriptionByTenantId($tenantId);
         
-        if (!$subscription || !$subscription['stripe_customer_id']) {
-            setFlashMessage('error', 'Assinatura não encontrada.');
-            redirect(APP_URL . '/dashboard');
-            return;
+        if (!$subscription) {
+            $_SESSION['error_message'] = 'Nenhuma assinatura ativa encontrada.';
+            header('Location: /subscription');
+            exit;
         }
         
-        // Criar sessão do portal de faturamento
-        $stripeService = new StripeService();
-        $session = $stripeService->createBillingPortalSession([
-            'customer' => $subscription['stripe_customer_id'],
-            'return_url' => APP_URL . '/subscription/manage'
-        ]);
+        // Obter detalhes do plano atual
+        $planModel = new Plan();
+        $currentPlan = $planModel->getPlanById($subscription['plan_id']);
         
-        // Redirecionar para o portal
-        redirect($session->url);
+        // Obter detalhes do novo plano
+        $newPlan = $planModel->getPlanById($newPlanId);
+        
+        if (!$newPlan) {
+            $_SESSION['error_message'] = 'Plano não encontrado.';
+            header('Location: /subscription/manage');
+            exit;
+        }
+        
+        // Calcular diferença de preço
+        $priceDifference = $newPlan['price'] - $currentPlan['price'];
+        $isUpgrade = $priceDifference > 0;
+        
+        // Incluir a view
+        require_once __DIR__ . '/../views/subscription/change-plan.php';
     }
     
     /**
-     * Cancela a assinatura atual
+     * Processa a mudança de plano
+     */
+    public function processChangePlan() {
+        // Verificar se o usuário está logado
+        if (!isset($_SESSION['user_id'])) {
+            header('Location: /auth/login');
+            exit;
+        }
+        
+        // Verificar se os dados foram enviados via POST
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            $_SESSION['error_message'] = 'Método inválido.';
+            header('Location: /subscription/manage');
+            exit;
+        }
+        
+        // Validar os dados recebidos
+        $newPlanId = isset($_POST['new_plan_id']) ? intval($_POST['new_plan_id']) : null;
+        
+        if (!$newPlanId) {
+            $_SESSION['error_message'] = 'Plano inválido.';
+            header('Location: /subscription/manage');
+            exit;
+        }
+        
+        $tenantId = $_SESSION['tenant_id'];
+        
+        // Realizar a mudança de plano
+        $result = $this->subscriptionService->changePlan($tenantId, $newPlanId);
+        
+        if (!$result) {
+            $_SESSION['error_message'] = 'Erro ao mudar plano.';
+            header('Location: /subscription/change-plan/' . $newPlanId);
+            exit;
+        }
+        
+        // Mudança realizada com sucesso
+        $_SESSION['success_message'] = 'Plano alterado com sucesso!';
+        header('Location: /subscription/manage');
+        exit;
+    }
+    
+    /**
+     * Exibe a página de cancelamento de assinatura
      */
     public function cancel() {
-        // Verificar se o usuário está autenticado
-        if (!isAuthenticated()) {
-            setFlashMessage('error', 'Faça login para continuar.');
-            redirect(APP_URL . '/auth/login');
-            return;
+        // Verificar se o usuário está logado
+        if (!isset($_SESSION['user_id'])) {
+            header('Location: /auth/login');
+            exit;
         }
         
         $tenantId = $_SESSION['tenant_id'];
         
-        // Carregar dados da assinatura
-        $pdo = db();
-        $stmt = $pdo->prepare("
-            SELECT * FROM subscriptions 
-            WHERE tenant_id = ? AND status != 'canceled'
-        ");
-        $stmt->execute([$tenantId]);
-        $subscription = $stmt->fetch();
+        // Obter detalhes da assinatura
+        $subscriptionModel = new Subscription();
+        $subscription = $subscriptionModel->getActiveSubscriptionByTenantId($tenantId);
         
         if (!$subscription) {
-            setFlashMessage('error', 'Assinatura não encontrada.');
-            redirect(APP_URL . '/dashboard');
-            return;
+            $_SESSION['error_message'] = 'Nenhuma assinatura ativa encontrada.';
+            header('Location: /subscription');
+            exit;
         }
         
-        // Formulário de confirmação ou processamento de cancelamento
-        if ($_SERVER['REQUEST_METHOD'] === 'POST') {
-            $reason = sanitize($_POST['reason'] ?? '');
-            $feedback = sanitize($_POST['feedback'] ?? '');
-            
-            // Cancelar assinatura no Stripe
-            if ($subscription['stripe_subscription_id']) {
-                $stripeService = new StripeService();
-                $stripeService->cancelSubscription($subscription['stripe_subscription_id']);
-            }
-            
-            // Atualizar status da assinatura no sistema
-            $stmt = $pdo->prepare("
-                UPDATE subscriptions 
-                SET status = 'canceled', ends_at = NOW(), updated_at = NOW() 
-                WHERE id = ?
-            ");
-            $stmt->execute([$subscription['id']]);
-            
-            // Registrar feedback do cancelamento
-            $stmt = $pdo->prepare("
-                INSERT INTO subscription_cancellations (tenant_id, subscription_id, reason, feedback) 
-                VALUES (?, ?, ?, ?)
-            ");
-            $stmt->execute([$tenantId, $subscription['id'], $reason, $feedback]);
-            
-            setFlashMessage('success', 'Sua assinatura foi cancelada com sucesso.');
-            redirect(APP_URL . '/subscription/plans');
-            return;
-        }
+        // Obter detalhes do plano
+        $planModel = new Plan();
+        $plan = $planModel->getPlanById($subscription['plan_id']);
         
-        // Exibir formulário de cancelamento
-        $pageTitle = 'Cancelar Assinatura';
-        require_once APP_PATH . '/views/subscription/cancel.php';
+        // Incluir a view
+        require_once __DIR__ . '/../views/subscription/cancel.php';
     }
-
+    
     /**
-     * Exibe a página pública de preços
+     * Processa o cancelamento de assinatura
      */
-    public function pricing() {
-        // Carregar todos os planos ativos
-        $pdo = db();
-        $stmt = $pdo->prepare("SELECT * FROM plans WHERE active = 1 ORDER BY price ASC");
-        $stmt->execute();
-        $plans = $stmt->fetchAll();
-        
-        // Processar features e limites como arrays
-        foreach ($plans as &$plan) {
-            $plan['features_array'] = json_decode($plan['features'], true) ?: [];
-            $plan['limits_array'] = json_decode($plan['limits'], true) ?: [];
+    public function processCancel() {
+        // Verificar se o usuário está logado
+        if (!isset($_SESSION['user_id'])) {
+            header('Location: /auth/login');
+            exit;
         }
         
-        // Exibir planos
-        $pageTitle = 'Preços e Planos';
-        require_once APP_PATH . '/views/subscription/pricing.php';
+        // Verificar se os dados foram enviados via POST
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            $_SESSION['error_message'] = 'Método inválido.';
+            header('Location: /subscription/manage');
+            exit;
+        }
+        
+        // Validar dados recebidos
+        $confirmCancel = isset($_POST['confirm_cancel']) ? $_POST['confirm_cancel'] : null;
+        
+        if ($confirmCancel !== 'yes') {
+            $_SESSION['error_message'] = 'Confirmação necessária para cancelar a assinatura.';
+            header('Location: /subscription/cancel');
+            exit;
+        }
+        
+        $tenantId = $_SESSION['tenant_id'];
+        
+        // Obter detalhes da assinatura
+        $subscriptionModel = new Subscription();
+        $subscription = $subscriptionModel->getActiveSubscriptionByTenantId($tenantId);
+        
+        if (!$subscription) {
+            $_SESSION['error_message'] = 'Nenhuma assinatura ativa encontrada.';
+            header('Location: /subscription');
+            exit;
+        }
+        
+        // Cancelar a assinatura no Stripe
+        $result = $this->stripeService->cancelSubscription($subscription['stripe_subscription_id']);
+        
+        if (!$result) {
+            $_SESSION['error_message'] = 'Erro ao cancelar assinatura.';
+            header('Location: /subscription/cancel');
+            exit;
+        }
+        
+        // Cancelamento realizado com sucesso
+        $_SESSION['success_message'] = 'Assinatura cancelada com sucesso.';
+        header('Location: /subscription');
+        exit;
+    }
+    
+    /**
+     * Exibe o Portal de Faturamento
+     */
+    public function billing() {
+        // Verificar se o usuário está logado
+        if (!isset($_SESSION['user_id'])) {
+            header('Location: /auth/login');
+            exit;
+        }
+        
+        $tenantId = $_SESSION['tenant_id'];
+        
+        // Obter detalhes da assinatura
+        $subscriptionModel = new Subscription();
+        $subscription = $subscriptionModel->getActiveSubscriptionByTenantId($tenantId);
+        
+        if (!$subscription) {
+            $_SESSION['error_message'] = 'Nenhuma assinatura ativa encontrada.';
+            header('Location: /subscription');
+            exit;
+        }
+        
+        // Obter histórico de faturas
+        $invoices = $subscriptionModel->getInvoicesBySubscriptionId($subscription['id']);
+        
+        // Obter métodos de pagamento
+        $paymentMethods = $this->stripeService->getPaymentMethods($subscription['stripe_customer_id']);
+        
+        // Incluir a view
+        require_once __DIR__ . '/../views/subscription/billing.php';
+    }
+    
+    /**
+     * Processa a adição de um novo método de pagamento
+     */
+    public function addPaymentMethod() {
+        // Verificar se o usuário está logado
+        if (!isset($_SESSION['user_id'])) {
+            header('Location: /auth/login');
+            exit;
+        }
+        
+        // Verificar se os dados foram enviados via POST
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            $_SESSION['error_message'] = 'Método inválido.';
+            header('Location: /subscription/billing');
+            exit;
+        }
+        
+        // Validar dados recebidos
+        $paymentMethodId = isset($_POST['payment_method_id']) ? $_POST['payment_method_id'] : null;
+        
+        if (!$paymentMethodId) {
+            $_SESSION['error_message'] = 'Método de pagamento inválido.';
+            header('Location: /subscription/billing');
+            exit;
+        }
+        
+        $tenantId = $_SESSION['tenant_id'];
+        
+        // Obter detalhes da assinatura
+        $subscriptionModel = new Subscription();
+        $subscription = $subscriptionModel->getActiveSubscriptionByTenantId($tenantId);
+        
+        if (!$subscription) {
+            $_SESSION['error_message'] = 'Nenhuma assinatura ativa encontrada.';
+            header('Location: /subscription');
+            exit;
+        }
+        
+        // Adicionar método de pagamento ao cliente
+        $result = $this->stripeService->attachPaymentMethod(
+            $subscription['stripe_customer_id'],
+            $paymentMethodId
+        );
+        
+        if (!$result) {
+            $_SESSION['error_message'] = 'Erro ao adicionar método de pagamento.';
+            header('Location: /subscription/billing');
+            exit;
+        }
+        
+        // Método adicionado com sucesso
+        $_SESSION['success_message'] = 'Método de pagamento adicionado com sucesso.';
+        header('Location: /subscription/billing');
+        exit;
+    }
+    
+    /**
+     * Exibe a página para nova tentativa de pagamento
+     */
+    public function retryPayment($invoiceId = null) {
+        // Verificar se o usuário está logado
+        if (!isset($_SESSION['user_id'])) {
+            header('Location: /auth/login');
+            exit;
+        }
+        
+        // Verificar se o invoice foi especificado
+        if (!$invoiceId) {
+            $_SESSION['error_message'] = 'Fatura não especificada.';
+            header('Location: /subscription/billing');
+            exit;
+        }
+        
+        $tenantId = $_SESSION['tenant_id'];
+        
+        // Obter detalhes da assinatura
+        $subscriptionModel = new Subscription();
+        $subscription = $subscriptionModel->getActiveSubscriptionByTenantId($tenantId);
+        
+        if (!$subscription) {
+            $_SESSION['error_message'] = 'Nenhuma assinatura ativa encontrada.';
+            header('Location: /subscription');
+            exit;
+        }
+        
+        // Obter detalhes da fatura
+        $invoice = $subscriptionModel->getInvoiceByStripeId($invoiceId);
+        
+        if (!$invoice || $invoice['subscription_id'] != $subscription['id']) {
+            $_SESSION['error_message'] = 'Fatura não encontrada.';
+            header('Location: /subscription/billing');
+            exit;
+        }
+        
+        // Obter métodos de pagamento
+        $paymentMethods = $this->stripeService->getPaymentMethods($subscription['stripe_customer_id']);
+        
+        // Incluir a view
+        require_once __DIR__ . '/../views/subscription/retry-payment.php';
+    }
+    
+    /**
+     * Processa uma nova tentativa de pagamento
+     */
+    public function processRetryPayment() {
+        // Verificar se o usuário está logado
+        if (!isset($_SESSION['user_id'])) {
+            header('Location: /auth/login');
+            exit;
+        }
+        
+        // Verificar se os dados foram enviados via POST
+        if ($_SERVER['REQUEST_METHOD'] !== 'POST') {
+            $_SESSION['error_message'] = 'Método inválido.';
+            header('Location: /subscription/billing');
+            exit;
+        }
+        
+        // Validar dados recebidos
+        $invoiceId = isset($_POST['invoice_id']) ? $_POST['invoice_id'] : null;
+        $paymentMethodId = isset($_POST['payment_method_id']) ? $_POST['payment_method_id'] : null;
+        
+        if (!$invoiceId || !$paymentMethodId) {
+            $_SESSION['error_message'] = 'Dados inválidos.';
+            header('Location: /subscription/billing');
+            exit;
+        }
+        
+        $tenantId = $_SESSION['tenant_id'];
+        
+        // Obter detalhes da assinatura
+        $subscriptionModel = new Subscription();
+        $subscription = $subscriptionModel->getActiveSubscriptionByTenantId($tenantId);
+        
+        if (!$subscription) {
+            $_SESSION['error_message'] = 'Nenhuma assinatura ativa encontrada.';
+            header('Location: /subscription');
+            exit;
+        }
+        
+        // Tentar o pagamento novamente
+        $result = $this->stripeService->retryInvoicePayment(
+            $invoiceId,
+            $paymentMethodId
+        );
+        
+        if (!$result['success']) {
+            $_SESSION['error_message'] = 'Erro ao processar pagamento: ' . $result['error'];
+            header('Location: /subscription/retry-payment/' . $invoiceId);
+            exit;
+        }
+        
+        // Pagamento realizado com sucesso
+        $_SESSION['success_message'] = 'Pagamento processado com sucesso!';
+        header('Location: /subscription/billing');
+        exit;
     }
 }
-
-// ESTE ARQUIVO AINDA PRECISA:
-// - Implementar webhooks para processamento de eventos do Stripe
-// - Melhorar tratamento de erros nas integrações com Stripe
-// - Adicionar suporte para upgrades e downgrades de plano
-// - Implementar notificações de renovação e falhas de pagamento
-?>
